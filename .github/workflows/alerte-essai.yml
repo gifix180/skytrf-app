@@ -1,0 +1,26 @@
+name: Alerte d'essai
+# Envoie tout de suite une alerte d'essai à chaque appareil abonné (secrets ALERTES_1 … ALERTES_5), pour vérifier
+# l'installation (28/10/2026). Actions → « Alerte d'essai » → Run workflow. Ne touche pas au relevé.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  essai:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: python -m pip install cryptography
+      - name: Envoyer l'alerte d'essai
+        env:
+          HGB_MOT_DE_PASSE: ${{ secrets.HGB_MOT_DE_PASSE }}
+          ALERTES_1: ${{ secrets.ALERTES_1 }}
+          ALERTES_2: ${{ secrets.ALERTES_2 }}
+          ALERTES_3: ${{ secrets.ALERTES_3 }}
+          ALERTES_4: ${{ secrets.ALERTES_4 }}
+          ALERTES_5: ${{ secrets.ALERTES_5 }}
+        run: python alertes.py --essai

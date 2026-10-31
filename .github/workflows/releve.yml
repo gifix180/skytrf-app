@@ -1,0 +1,100 @@
+name: Relevé PMU
+# Relevé PMU du jour (réunions en France), chiffré avec le mot de passe (secret HGB_MOT_DE_PASSE) dans pmu.enc, lu par
+# la page. GitHub ne lance les tâches programmées que très irrégulièrement (3 fois par jour au lieu de 30 les 23-24/10) :
+# une seule exécution fait donc une BOUCLE (relevé toutes les 15 min pendant ~5 h 40), puis se relance elle-même,
+# jour et nuit (pas de relevé de 23 h à 8 h, heure de Paris). Si la chaîne casse : dépôt de la page (push) ou horaires.
+# Le matin, elle lance aussi le suivi du dépôt privé (secret SUIVI_TOKEN), dont GitHub retarde les horaires.
+# Un seul commit gardé (pas d'historique qui grossit).
+on:
+  push:                       # dépôt de la page (clé du dépôt privé) : redémarre la chaîne. Pas de filtre « paths » :
+    branches: [main]          # avec un commit unique remplacé (force-push), GitHub ne déclenchait rien (24-25/10/2026).
+                              # Les relevés eux-mêmes (jeton GitHub de l'automatisme) ne déclenchent pas d'exécution.
+  schedule:                   # heures UTC (8 h Paris = 7 h UTC l'hiver, 6 h UTC l'été) ; une exécution en attente au plus
+    - cron: "7 6 * * *"
+    - cron: "7 7 * * *"
+    - cron: "37 7 * * *"
+    - cron: "7 8 * * *"
+    - cron: "7 9 * * *"
+    - cron: "7 10 * * *"
+    - cron: "7 13 * * *"
+    - cron: "7 16 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: releve
+  cancel-in-progress: false
+jobs:
+  releve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: python -m pip install cryptography
+      - name: Relevés toutes les 15 minutes
+        env:
+          HGB_MOT_DE_PASSE: ${{ secrets.HGB_MOT_DE_PASSE }}
+          # alertes sur le téléphone (28/10/2026, alertes.py) : un secret par appareil, texte du bouton « Alertes »
+          ALERTES_1: ${{ secrets.ALERTES_1 }}
+          ALERTES_2: ${{ secrets.ALERTES_2 }}
+          ALERTES_3: ${{ secrets.ALERTES_3 }}
+          ALERTES_4: ${{ secrets.ALERTES_4 }}
+          ALERTES_5: ${{ secrets.ALERTES_5 }}
+          # lancement du suivi du matin du dépôt privé (28/10/2026) : GitHub retarde ses horaires de plusieurs heures ;
+          # clé « fine-grained » limitée à SkyTrf, droit Actions seulement (secret SUIVI_TOKEN ; absent = rien n'est lancé)
+          SUIVI_TOKEN: ${{ secrets.SUIVI_TOKEN }}
+        run: |
+          git config user.name "hgb-bot"; git config user.email "hgb-bot@users.noreply.github.com"
+          publier() {
+            for i in 1 2 3 4 5; do
+              git fetch -q --depth 1 origin main && git checkout -q -B main origin/main && git reset -q --hard origin/main
+              BASE=$(git rev-parse HEAD)
+              cp /tmp/pmu.enc pmu.enc
+              if [ -f /tmp/alertes_envoyees.json ]; then cp /tmp/alertes_envoyees.json alertes_envoyees.json; fi
+              if [ -f /tmp/suivi_lance.txt ]; then cp /tmp/suivi_lance.txt suivi_lance.txt; fi
+              git checkout -q --orphan neuf && git add -A
+              git commit -q -m "Relevé PMU $(TZ=Europe/Paris date +%F' '%H:%M)" || { git checkout -q main; git branch -D neuf -q; return 0; }
+              if git push -q --force-with-lease=main:$BASE origin neuf:main; then git checkout -q -B main origin/main 2>/dev/null; git branch -D neuf -q 2>/dev/null; echo "relevé publié $(TZ=Europe/Paris date +%H:%M)"; return 0; fi
+              git checkout -q main; git branch -D neuf -q; sleep 20
+            done
+            return 1
+          }
+          # suivi du matin (dépôt privé) : lancé une fois entre 8 h 55 et 9 h 55, puis une fois entre 10 h 05 et 11 h 05
+          # (si le 1er gel a été reporté faute de cotes) ; sans effet si le gel est déjà fait (jamais écrasé)
+          if [ -f suivi_lance.txt ]; then cp suivi_lance.txt /tmp/suivi_lance.txt; fi
+          lancer_suivi() {
+            [ -n "$SUIVI_TOKEN" ] || return 0
+            local j m c
+            j=$(TZ=Europe/Paris date +%F); m=$(( 10#$(TZ=Europe/Paris date +%H) * 60 + 10#$(TZ=Europe/Paris date +%M) ))
+            for c in 535 605; do
+              if [ "$m" -ge "$c" ] && [ "$m" -lt $((c + 60)) ] && ! grep -qx "$j $c" /tmp/suivi_lance.txt 2>/dev/null; then
+                if GH_TOKEN="$SUIVI_TOKEN" gh workflow run suivi-a-blanc.yml --ref main -R gifix180/SkyTrf -f action=matin; then
+                  echo "$j $c" >> /tmp/suivi_lance.txt; echo "suivi du matin lancé $(TZ=Europe/Paris date +%H:%M)"
+                else echo "::warning::lancement du suivi refusé (clé SUIVI_TOKEN expirée ou sans droit Actions ?)"; fi
+              fi
+            done
+          }
+          # la chaîne tourne jour et nuit (dépôt public : minutes gratuites) ; la nuit (23 h → 8 h), pas de relevé, elle
+          # attend et se relance, pour être prête à 8 h sans dépendre des horaires de GitHub (28/10/2026)
+          fin=$(( $(date +%s) + 340 * 60 ))
+          while :; do
+            h=$(TZ=Europe/Paris date +%-H)
+            if [ "$h" -ge 23 ] || [ "$h" -lt 8 ]; then
+              echo "nuit : pas de relevé"
+            else
+              lancer_suivi
+              if python releve.py; then if [ -f alertes_envoyees.json ]; then cp alertes_envoyees.json /tmp/; fi; cp pmu.enc /tmp/pmu.enc && publier || echo "::warning::publication échouée"; else echo "::warning::relevé PMU échoué"; fi
+            fi
+            [ "$(date +%s)" -gt "$fin" ] && break
+            sleep 900
+          done
+      - name: Relancer la chaîne
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run releve.yml --ref main -R "$GITHUB_REPOSITORY" && echo "chaîne relancée"
