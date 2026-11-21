@@ -1,0 +1,71 @@
+name: Relevé fin
+# 21/11/2026 : relevé des courses du jour juste avant le départ, pour le dépôt privé du projet (lecture et écriture avec
+# la clé SKYTRF_TOKEN, limitée à ce dépôt). RIEN n'est affiché dans le journal public : le programme écrit son journal
+# dans le dépôt privé. Lancée chaque matin par la chaîne du relevé (releve.yml) ; se relance seule tant qu'il reste des
+# courses dans la journée (une exécution dure au plus ~5 h 40).
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "durée maximale de l'exécution (minutes)"
+        required: false
+        default: "340"
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: releve-fin
+  cancel-in-progress: false
+jobs:
+  fin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Préparer
+        env:
+          SKYTRF_TOKEN: ${{ secrets.SKYTRF_TOKEN }}
+        run: |
+          [ -n "$SKYTRF_TOKEN" ] || { echo "::error::secret SKYTRF_TOKEN absent"; exit 1; }
+          U="https://x-access-token:${SKYTRF_TOKEN}@github.com/gifix180/SkyTrf.git"
+          git config --global user.name "hgb-bot"; git config --global user.email "hgb-bot@users.noreply.github.com"
+          git clone -q --depth 1 "$U" prive > /dev/null 2>&1 || { echo "::error::lecture du dépôt privé refusée"; exit 1; }
+          if ! git ls-remote --exit-code --heads "$U" donnees-cotes-fin > /dev/null 2>&1; then
+            mkdir neuf && cd neuf && git init -q -b donnees-cotes-fin && echo "Données du bilan § 117 (jamais fusionnée)." > README.md \
+              && git add README.md && git commit -q -m "Branche de données" && git push -q "$U" donnees-cotes-fin > /dev/null 2>&1 && cd ..
+          fi
+          git clone -q --depth 1 --branch donnees-cotes-fin "$U" donnees > /dev/null 2>&1 || { echo "::error::branche de données illisible"; exit 1; }
+          echo "prêt"
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Relever
+        id: r
+        env:
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          set +e
+          debut=$(date +%s)
+          mkdir -p donnees/journal
+          python prive/tools/argent/cotes_fin_collecte.py donnees "${MINUTES:-340}" > /dev/null 2>> "donnees/journal/erreurs_$(TZ=Europe/Paris date +%F).log"
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"; echo "duree=$(( $(date +%s) - debut ))" >> "$GITHUB_OUTPUT"
+          echo "collecte arrêtée ($code)"
+      - name: Enregistrer
+        if: always()
+        run: |
+          cd donnees 2>/dev/null || exit 0
+          find journal -name 'erreurs_*.log' -size 0 -delete 2>/dev/null
+          git add -A && git commit -q -m "Relevé fin $(TZ=Europe/Paris date +%F' '%H:%M)" > /dev/null 2>&1 || { echo "rien de nouveau"; exit 0; }
+          for i in 1 2 3; do git pull -q --rebase > /dev/null 2>&1 && git push -q > /dev/null 2>&1 && { echo "enregistré"; exit 0; }; sleep 5; done
+          echo "::warning::enregistrement refusé"
+      - name: Relancer
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODE: ${{ steps.r.outputs.code }}
+          DUREE: ${{ steps.r.outputs.duree }}
+        run: |
+          h=$(TZ=Europe/Paris date +%-H)
+          # 3 = temps écoulé avec des courses restantes ; panne : relance seulement après 10 min de marche (pas de boucle)
+          if [ "$CODE" = 3 ] || { [ -n "$CODE" ] && [ "$CODE" != 0 ] && [ "${DUREE:-0}" -gt 600 ] && [ "$h" -lt 22 ]; }; then
+            gh workflow run releve-fin.yml --ref main -R "$GITHUB_REPOSITORY" && echo "relancée"
+          else echo "terminé pour aujourd'hui"; fi

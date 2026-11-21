@@ -1,0 +1,102 @@
+name: Suivi et page
+# 15/11/2026 : le dépôt privé n'a plus de minutes gratuites ; le suivi à blanc et la page du jour tournent ICI (dépôt
+# public : minutes gratuites). Le code et les données restent dans le dépôt privé : la tâche le lit avec une clé
+# limitée à ce dépôt (secret SKYTRF_TOKEN), calcule, y réécrit les résultats, puis dépose la page chiffrée ici.
+# RIEN n'est affiché dans le journal public : tout ce que les programmes écrivent va dans un journal rangé dans le dépôt
+# privé (controle/chaine/). Lancée par la chaîne du relevé (matin et nuit) ou à la main.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "matin, soir, bilan, stats, reussite, page (page seule), import (contrôle direct / rejeu d'un jour passé : jour obligatoire)"
+        required: true
+        default: "matin"
+      jour:
+        description: "AAAA-MM-JJ (vide = aujourd'hui)"
+        required: false
+permissions:
+  contents: write
+  actions: read
+concurrency:
+  group: suivi
+  cancel-in-progress: false
+jobs:
+  suivi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Lire le dépôt privé
+        env:
+          SKYTRF_TOKEN: ${{ secrets.SKYTRF_TOKEN }}
+        run: |
+          [ -n "$SKYTRF_TOKEN" ] || { echo "::error::secret SKYTRF_TOKEN absent"; exit 1; }
+          git clone -q --depth 1 "https://x-access-token:${SKYTRF_TOKEN}@github.com/gifix180/SkyTrf.git" prive > /dev/null 2>&1 \
+            || { echo "::error::lecture du dépôt privé refusée (clé expirée ou sans droit ?)"; exit 1; }
+          echo "dépôt privé lu"
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Installer
+        run: python -m pip install -q -e prive cryptography > /dev/null 2>&1 && echo "installé"
+      - name: Calculer (journal privé)
+        env:
+          ACTION: ${{ inputs.action }}
+          JOUR: ${{ inputs.jour }}
+          HGB_MOT_DE_PASSE: ${{ secrets.HGB_MOT_DE_PASSE }}
+        run: |
+          cd prive
+          mkdir -p controle/chaine
+          J="controle/chaine/$(TZ=Europe/Paris date +%F_%H%M)_${ACTION}.log"
+          {
+            set +e
+            case "$ACTION" in
+              matin) python tools/suivi/suivi.py soir; python tools/suivi/suivi.py matin $JOUR ;;
+              page) ;;
+              import) python tools/suivi/suivi.py import "$JOUR" ;;
+              *) python tools/suivi/suivi.py "$ACTION" ;;
+            esac
+            if [ "$ACTION" != "page" ]; then
+              python tools/suivi/suivi.py reussite
+              python tools/suivi/suivi.py chronos
+              case "$ACTION" in matin|soir) python tools/suivi/suivi.py formats ;; esac
+            fi
+            python tools/page/libre/construire.py $JOUR -o ../index.html
+            echo "fin $(date -u +%F' '%H:%M) UTC"
+          } > "$J" 2>&1
+          ls -t controle/chaine/*.log | tail -n +60 | xargs -r rm -f      # journaux : les 60 derniers seulement
+          [ -f ../index.html ] && echo "calcul terminé, page construite" || echo "calcul terminé, PAGE NON CONSTRUITE (voir le journal privé)"
+      - name: Enregistrer dans le dépôt privé
+        run: |
+          cd prive
+          git config user.name "hgb-bot"; git config user.email "hgb-bot@users.noreply.github.com"
+          for d in suivi controle src/hgb/score/stats_maj; do if [ -d "$d" ]; then git add "$d"; fi; done
+          git commit -q -m "Suivi à blanc : ${{ inputs.action }} $(date -u +%F' '%H:%M) UTC (chaîne skytrf-app)" > /dev/null 2>&1 || { echo "rien de nouveau"; exit 0; }
+          for i in 1 2 3; do git pull -q --rebase > /dev/null 2>&1 && git push -q > /dev/null 2>&1 && { echo "enregistré"; exit 0; }; sleep 5; done
+          echo "::error::enregistrement refusé"; exit 1
+      - name: Déposer la page
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ -f index.html ] || { echo "pas de page"; exit 0; }
+          git config --global user.name "hgb-bot"; git config --global user.email "hgb-bot@users.noreply.github.com"
+          git clone -q --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" pages
+          cd pages
+          attendre_pages() {
+            local k n
+            for k in $(seq 1 12); do
+              n=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?per_page=10" --jq '[.workflow_runs[]|select(.name=="pages build and deployment" and .status!="completed")]|length' 2>/dev/null || echo 0)
+              [ "${n:-0}" = 0 ] && return 0; sleep 15
+            done
+          }
+          for i in 1 2 3 4 5; do
+            attendre_pages
+            git fetch -q --depth 1 origin main && git reset -q --hard origin/main
+            BASE=$(git rev-parse HEAD)
+            cp ../index.html index.html
+            if [ -f ../alertes.enc ]; then cp ../alertes.enc alertes.enc; fi
+            cp ../prive/tools/page/libre/app/manifest.webmanifest ../prive/tools/page/libre/app/sw.js ../prive/tools/page/libre/app/*.png .
+            git checkout -q --orphan neuf && git add -A
+            git commit -q -m "Page du $(TZ=Europe/Paris date +%F' '%H:%M)" > /dev/null || { echo "rien de nouveau"; exit 0; }
+            if git push -q --force-with-lease=main:$BASE origin neuf:main > /dev/null 2>&1; then echo "page déposée"; exit 0; fi
+            git checkout -q -B main origin/main; git branch -D neuf -q; sleep 20
+          done
+          exit 1

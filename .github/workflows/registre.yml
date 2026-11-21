@@ -1,0 +1,35 @@
+name: Registre des entraîneurs
+# 15/11/2026 : 2e passe du registre public des entreprises (lieu des entraîneurs), lancée à la main. Code et données
+# dans le dépôt privé (secret SKYTRF_TOKEN) ; journal muet ici.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: registre
+  cancel-in-progress: false
+jobs:
+  collecte:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Lire le dépôt privé
+        env: {SKYTRF_TOKEN: "${{ secrets.SKYTRF_TOKEN }}"}
+        run: |
+          git clone -q --depth 1 "https://x-access-token:${SKYTRF_TOKEN}@github.com/gifix180/SkyTrf.git" prive > /dev/null 2>&1 || { echo "::error::lecture refusée"; exit 1; }
+          git clone -q --depth 1 --branch donnees-registre "https://x-access-token:${SKYTRF_TOKEN}@github.com/gifix180/SkyTrf.git" donnees > /dev/null 2>&1 || { echo "::error::branche des données illisible"; exit 1; }
+          echo "dépôt privé lu"
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Collecte (journal privé)
+        run: |
+          mkdir -p donnees/journaux
+          python prive/tools/registre/entraineurs_collecte2.py donnees/registre prive/src/hgb/reussite/entraineurs_lieux.json.gz > donnees/journaux/passe2.log 2>&1 \
+            && echo "collecte terminée" || echo "collecte en erreur (voir le journal privé)"
+      - name: Enregistrer
+        if: always()
+        run: |
+          cd donnees
+          git config user.name "hgb-bot"; git config user.email "hgb-bot@users.noreply.github.com"
+          git add -A && (git commit -q -m "Registre : 2e passe" > /dev/null 2>&1 || true)
+          git push -q origin HEAD:donnees-registre > /dev/null 2>&1 && echo "enregistré" || { echo "::error::enregistrement refusé"; exit 1; }
