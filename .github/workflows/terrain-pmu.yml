@@ -1,0 +1,38 @@
+name: Heure du terrain PMU (essai)
+# 24/11/2026 : à quelle heure le PMU publie-t-il le terrain du gazon ? Un relevé du programme toutes les 15 min pendant
+# ~5 h 30 (une requête par relevé). Code et données dans le dépôt privé ; journal muet ici.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 5 * * *'          # 6 h Paris (horaires GitHub parfois en retard ; l'heure de chaque relevé est notée)
+permissions:
+  contents: read
+concurrency:
+  group: terrain-pmu
+  cancel-in-progress: false
+jobs:
+  releve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Lire le dépôt privé
+        env: {SKYTRF_TOKEN: "${{ secrets.SKYTRF_TOKEN }}"}
+        run: |
+          git clone -q --depth 1 "https://x-access-token:${SKYTRF_TOKEN}@github.com/gifix180/SkyTrf.git" prive > /dev/null 2>&1 || { echo "::error::lecture refusée"; exit 1; }
+          git clone -q --depth 1 --branch donnees-terrain-pmu "https://x-access-token:${SKYTRF_TOKEN}@github.com/gifix180/SkyTrf.git" donnees > /dev/null 2>&1 || { echo "::error::branche illisible"; exit 1; }
+          echo "dépôt privé lu"
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Relevés toutes les 15 min (journal privé)
+        run: |
+          cd donnees
+          git config user.name "hgb-bot"; git config user.email "hgb-bot@users.noreply.github.com"
+          mkdir -p releves journaux
+          for i in $(seq 1 22); do
+            python ../prive/tools/terrain/pmu_terrain_heures.py releves >> journaux/$(date -u +%F).log 2>&1 || true
+            git add -A && (git commit -q -m "Relevé terrain PMU" > /dev/null 2>&1 || true)
+            git pull -q --rebase origin donnees-terrain-pmu > /dev/null 2>&1 || true
+            git push -q origin HEAD:donnees-terrain-pmu > /dev/null 2>&1 || true
+            sleep 900
+          done
+          echo "relevés terminés"
